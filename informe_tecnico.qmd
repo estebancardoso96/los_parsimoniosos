@@ -1,0 +1,225 @@
+---
+title: "Entrega final: Proyecto de mejora en la inversión en educación: ¿qué factores están detrás del desempeño estudiantil en matemática?"
+subtitle: "Grupo Los Parsimoniosos"
+execute:
+  echo: false      # No muestra el código
+  warning: false   # Oculta warnings
+  message: false   # Oculta mensajes
+format:
+  pdf:
+    toc: true
+    number-sections: true
+---
+
+
+```{python}
+# =====================================================================
+# PASO 0: Importación de librerías
+# =====================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mtick
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.metrics import roc_auc_score, confusion_matrix, precision_recall_curve, ConfusionMatrixDisplay 
+from fairlearn.metrics import MetricFrame, selection_rate
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+```
+
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+
+print("Cargando datasets desde INEEd...")
+url_cxto = "https://www.ineed.edu.uy/wp-content/uploads/2023/08/Datos_Estudiante_CXTO.csv"
+url_socio = "https://www.ineed.edu.uy/wp-content/uploads/2023/08/Datos_Estudiante_Socioemocional.csv"
+
+# Se agrega el parámetro encoding='latin-1' y decimal=','
+df_cxto = pd.read_csv(url_cxto, sep=';', encoding='latin-1', decimal=',')
+df_socio = pd.read_csv(url_socio, sep=';', encoding='latin-1', decimal=',')
+
+# Unir los dataframes preservando el padrón completo de contexto.
+# Se usa left join para que los estudiantes que no tengan información socioemocional
+# no desaparezcan del modelo de propensión.
+cols_socio_nuevas = df_socio.columns.difference(df_cxto.columns).tolist() + ["AlumnoCodigoDes"]
+df_merged = df_cxto.merge(df_socio[cols_socio_nuevas], on="AlumnoCodigoDes", how="outer")
+```
+
+
+```{python}
+#| echo: false
+print("Calculando pesos de propensión con probabilidad directa por grupo...")
+
+# 1. Definir variable objetivo R
+# R = 1 si el estudiante rindió la prueba de matemática; 0 en caso contrario
+df_merged['R'] = df_merged['Niveles_MAT'].notna().astype(int)
+
+print(f"Observaciones en el padrón completo: {len(df_merged)}")
+print(f"Observaciones con MAT disponible: {df_merged['R'].sum()}")
+
+# 2. Calcular probabilidad de participación directa por grupo
+# p_hat(grupo) = fracción de estudiantes del grupo que rindieron la prueba
+prob_participacion_grupo = (
+    df_merged.groupby('GrupoCodigoDes', dropna=False)['R'].mean()
+)
+
+# Asignar a cada estudiante la probabilidad de su grupo
+df_merged['p_hat'] = df_merged['GrupoCodigoDes'].map(prob_participacion_grupo)
+
+# Weight Trimming: limitamos probabilidad mínima a 0.05
+# Esto evita que pesos muy grandes aparezcan cuando p_hat es muy bajo.
+df_merged['p_hat'] = df_merged['p_hat'].clip(lower=0.01)
+
+# 3. Filtrar el dataset final y calcular pesos ajustados
+# Solo las observaciones que sí tienen calificación en matemática serán usadas
+# posteriormente en el modelo de aprendizaje. Para ellas, el peso original se ajusta
+# dividiendo por la probabilidad estimada de haber realizado la prueba.
+df_final = df_merged[df_merged['R'] == 1].copy()
+df_final['peso_ajustado'] = df_final['peso_MEst'] / df_final['p_hat']
+
+# 4. Normalización
+# El objetivo es que la suma de los pesos ajustados siga siendo consistente con
+# el total del padrón original, preservando la representatividad poblacional.
+suma_peso_original_total = df_merged['peso_MEst'].sum()
+suma_peso_ajustado = df_final['peso_ajustado'].sum()
+
+factor_normalizacion = suma_peso_original_total / suma_peso_ajustado
+df_final['peso_final_MAT'] = df_final['peso_ajustado'] * factor_normalizacion
+
+# Verificación
+print("-" * 50)
+print(f"Observaciones iniciales (padron total): {len(df_merged)}")
+print(f"Observaciones finales (solo test MAT): {len(df_final)}")
+print(f"Suma de pesos original: {suma_peso_original_total:.2f}")
+print(f"Suma de pesos ajustados: {df_final['peso_final_MAT'].sum():.2f}")
+print("-" * 50)
+```
+
+```{python}
+# =====================================================================
+# PASO 2: Construcción de dataframes de trabajo (X, y, w)
+# =====================================================================
+
+# Diccionario para mapear las variables predictoras
+mapa_variables = {
+
+    # =========================================================
+    # DATASET: CXTO (Datos de Contexto y Diseño Muestral)
+    # =========================================================
+    
+    # --- Variables Demográficas y Geográficas ---
+    "MdeoInt"               : "zona",
+    "regiones"              : "region",
+    "EF46m"                 : "departamento_residencia",
+    "categoria_centro"      : "categoria_centro",
+    "categoria_grupo"       : "categoria_grupo",
+    "AlumnoGenero"          : "alumno_genero",
+    "EF2d"                  : "ascendencia",
+    "EF2b"                  : "pais_nacimiento",
+    "EDAD"                  : "edad",
+    
+    # --- Índices de Estatus Económico y Social ---
+    "INSE"                  : "idx_inse_alumno",
+    "ESCS_Alumno"           : "idx_esec_alumno",
+    "ESCS_Centro"           : "idx_esec_centro",
+    "ESCS_Grupo"            : "idx_esec_grupo",
+
+    # =========================================================
+    # DATASET: SOCIO (Cuestionario Socioemocional)
+    # =========================================================
+    # --- Índices de Contexto y Actitudes ---
+    "ESTSENTPER_E_ESC50"    : "idx_sentido_pertenencia",
+    "VINCENTREEST_E_ESC50"  : "idx_vinculo_entre_estudiantes",
+    "VINESTADS_E_ESC50"     : "idx_vinculo_estudiantes_adscriptos",
+    "VINESTPROF_E_ESC50"    : "idx_vinculo_estudiantes_docentes",
+    "VOZESTU_E_ESC50"       : "idx_voz_estudiante",
+    "ACTITUDLEC_E_ESC50"    : "idx_actitud_lectura",
+    "ACTITUDMAT_E_ESC50"    : "idx_actitud_matematica",
+    
+    # --- Índices de Habilidades Socioemocionales y Cognitivas ---
+    "AUTOCON_E_ESC50"       : "idx_autocontrol",
+    "AUTOEIDE_E_ESC50"      : "idx_autoeficacia_idioma_espanol",
+    "AUTOEMAT_E_ESC50"      : "idx_autoeficacia_matematica",
+    "AUTOMETA_E_ESC50"      : "idx_autoregulacion_metacognitiva",
+    "EMPATIA_E_ESC50"       : "idx_empatia",
+    "EXTERNALIZ_E_ESC50"    : "idx_conductas_externalizantes",
+    "HABINTER_E_ESC50"      : "idx_habilidades_interperonales",
+    "HABINTRA_E_ESC50"      : "idx_habilidades_intrapersonales",
+    "HABRELAC_E_ESC50"      : "idx_habilidades_relacionamiento",
+    "INTERNALIZ_E_ESC50"    : "idx_conductas_internalizantes", 
+    "MOTAUTREGA_E_ESC50"    : "idx_motivacion_aprendizaje",
+    "MOTINT_E_ESC50"        : "idx_motivacion_intrinseca",
+    "PERSAC_E_ESC50"        : "idx_perseverancia_academica",
+    "REGEMO_E_ESC50"        : "idx_regulacion_emocional",
+    "VALTIDE_E_ESC50"       : "idx_valoracion_tarea_idioma_espanol",
+    "VALTMAT_E_ESC50"       : "idx_valoracion_tarea_matematica"
+}
+
+# Renombrar columnas. Como evitamos los sufijos _x/_y, las variables originales están intactas.
+df_final = df_final.rename(columns=mapa_variables)
+
+# Crear dataset X asegurando que SOLO contiene las variables mapeadas
+variables_modelo = list(mapa_variables.values())
+X = df_final[variables_modelo].copy()
+
+# Reemplazar códigos numéricos de "No sabe / No contesta" por nulos reales (NaN)
+# tanto en ascendencia como en otras variables sociodemográficas
+X = X.replace({99: np.nan, 98: np.nan, "99": np.nan, "98": np.nan})
+
+# Construir la variable objetivo binaria
+# 1 (satisfactorio) = N4 o N5; 0 (insatisfactorio) = B1, N1, N2 o N3
+y = np.where(df_final["Niveles_MAT"].isin(["N4", "N5"]), 0, 1)
+
+# Construir el vector de pesos muestrales
+w = df_final["peso_final_MAT"].values
+```
+
+## EDA
+
+### Auditoría de variables
+```{python}
+df_final_modelo = df_final[variables_modelo].copy()
+df_final_modelo['target'] = y
+
+print("AUDITORIA DE VARIABLES DEL DATASET df_final_modelo")
+
+print(f"\nDimensiones del dataset: {df_final_modelo.shape[0]} filas × {df_final_modelo.shape[1]} columnas\n")
+
+audit = pd.DataFrame({
+    'dtype':          df_final_modelo.dtypes,
+    'nulos':          df_final_modelo.isnull().sum(),
+    'pct_nulos':      (df_final_modelo.isnull().sum() / len(df_final_modelo) * 100).round(2),
+    'valores_únicos': df_final_modelo.nunique(),
+    'moda':           df_final_modelo.mode().iloc[0], # Extrae la primera fila de la moda
+    'ejemplo':        df_final_modelo.sample(1).iloc[0], # Genera muestra aleatoria y extrae primera fila
+    })
+```
+
+
+\newpage
+```{python}
+#| echo: false
+#| tbl-cap: "Auditoría de variables del dataset"
+
+from IPython.display import Markdown
+
+Markdown(audit.to_markdown())
+```
+

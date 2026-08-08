@@ -1,0 +1,927 @@
+---
+title: "Entrega final: Proyecto de mejora en la inversión en educación: ¿qué factores están detrás del desempeño estudiantil en matemática?"
+subtitle: "Grupo Los Parsimoniosos"
+lang: es
+execute:
+  echo: false      # No muestra el código
+  warning: false   # Oculta warnings
+  message: false   # Oculta mensajes
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    include-in-header:
+      text: |
+        \usepackage{rotating}
+---
+
+\newpage
+
+### Introducción
+
+El desempeño educativo de los estudiantes es el resultado de un conjunto de factores que interactúan entre sí y que abarcan dimensiones sociales, económicas, familiares, escolares e individuales. En particular, el aprendizaje de la matemática constituye una dimensión relevante del desarrollo educativo, debido a su carácter acumulativo y a su contribución al desarrollo de capacidades analíticas, lógicas y de resolución de problemas.
+
+Comprender los factores asociados al desempeño matemático permite avanzar más allá de la descripción de los resultados obtenidos por los estudiantes y aproximarse a la identificación de las condiciones que se relacionan con un mejor o peor desempeño. Este conocimiento resulta especialmente relevante para la formulación de políticas educativas, dado que permite identificar dimensiones potencialmente susceptibles de intervención y orientar los recursos hacia aquellos factores que presentan una mayor asociación con los resultados de aprendizaje.
+
+El presente trabajo analiza información proveniente de una encuesta realizada por el Instituto Nacional de Evaluación Educativa (INEEd) en 2022, dirigida a estudiantes de educación media de Uruguay. Cada estudiante encuestado debió completar cuatro instancias, dos formularios, uno de contexto y otro socioemocional del alumno, y dos pruebas, una de matemática y una de lectura. 
+
+A efectos de este trabajo se decidió excluir del análisis la prueba de lectura, tomando a la prueba de matemática como nuestro target y los formularios de contexto y socioemocional nuestros features. En la economía del conocimiento, formar recursos humanos que manejen adecuadamente la matemática, ayudará a elevar la capacidad de investigación y desarrollo local y por ende mejorar la competitividad del país.
+Por eso es relevante investigar los resultados que el país está logrando en el desempeño matemático y ejecutar acciones que mejoren ese desempeño.
+
+A partir de esta información, el estudio busca identificar los principales factores asociados al desempeño de los estudiantes en matemática, integrando variables correspondientes a diferentes dimensiones de su experiencia educativa y social. Para ello, se desarrolla un análisis exploratorio de los datos y posteriormente se aplican herramientas de modelización estadística y de aprendizaje automático orientadas a identificar las variables con mayor relevancia para distinguir entre estudiantes que alcanzan o no determinados niveles de desempeño.
+
+```{python}
+# =====================================================================
+# PASO 0: Importación de librerías
+# =====================================================================
+
+import math
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mtick
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.metrics import roc_auc_score, confusion_matrix, precision_recall_curve, ConfusionMatrixDisplay 
+from fairlearn.metrics import MetricFrame, selection_rate
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+
+#print("Cargando datasets desde INEEd...")
+url_cxto = "https://www.ineed.edu.uy/wp-content/uploads/2023/08/Datos_Estudiante_CXTO.csv"
+url_socio = "https://www.ineed.edu.uy/wp-content/uploads/2023/08/Datos_Estudiante_Socioemocional.csv"
+
+# Se agrega el parámetro encoding='latin-1' y decimal=','
+df_cxto = pd.read_csv(url_cxto, sep=';', encoding='latin-1', decimal=',')
+df_socio = pd.read_csv(url_socio, sep=';', encoding='latin-1', decimal=',')
+
+# Unir los dataframes preservando el padrón completo de contexto.
+# Se usa left join para que los estudiantes que no tengan información socioemocional
+# no desaparezcan del modelo de propensión.
+cols_socio_nuevas = df_socio.columns.difference(df_cxto.columns).tolist() + ["AlumnoCodigoDes"]
+df_merged = df_cxto.merge(df_socio[cols_socio_nuevas], on="AlumnoCodigoDes", how="outer")
+```
+
+
+```{python}
+#| echo: false
+#print("Calculando pesos de propensión con probabilidad directa por grupo...")
+
+# 1. Definir variable objetivo R
+# R = 1 si el estudiante rindió la prueba de matemática; 0 en caso contrario
+df_merged['R'] = df_merged['Niveles_MAT'].notna().astype(int)
+
+#print(f"Observaciones en el padrón completo: {len(df_merged)}")
+#print(f"Observaciones con MAT disponible: {df_merged['R'].sum()}")
+
+# 2. Calcular probabilidad de participación directa por grupo
+# p_hat(grupo) = fracción de estudiantes del grupo que rindieron la prueba
+prob_participacion_grupo = (
+    df_merged.groupby('GrupoCodigoDes', dropna=False)['R'].mean()
+)
+
+# Asignar a cada estudiante la probabilidad de su grupo
+df_merged['p_hat'] = df_merged['GrupoCodigoDes'].map(prob_participacion_grupo)
+
+# Weight Trimming: limitamos probabilidad mínima a 0.05
+# Esto evita que pesos muy grandes aparezcan cuando p_hat es muy bajo.
+df_merged['p_hat'] = df_merged['p_hat'].clip(lower=0.01)
+
+# 3. Filtrar el dataset final y calcular pesos ajustados
+# Solo las observaciones que sí tienen calificación en matemática serán usadas
+# posteriormente en el modelo de aprendizaje. Para ellas, el peso original se ajusta
+# dividiendo por la probabilidad estimada de haber realizado la prueba.
+df_final = df_merged[df_merged['R'] == 1].copy()
+df_final['peso_ajustado'] = df_final['peso_MEst'] / df_final['p_hat']
+
+# 4. Normalización
+# El objetivo es que la suma de los pesos ajustados siga siendo consistente con
+# el total del padrón original, preservando la representatividad poblacional.
+suma_peso_original_total = df_merged['peso_MEst'].sum()
+suma_peso_ajustado = df_final['peso_ajustado'].sum()
+
+factor_normalizacion = suma_peso_original_total / suma_peso_ajustado
+df_final['peso_final_MAT'] = df_final['peso_ajustado'] * factor_normalizacion
+
+# Verificación
+#print("-" * 50)
+#print(f"Observaciones iniciales (padron total): {len(df_merged)}")
+#print(f"Observaciones finales (solo test MAT): {len(df_final)}")
+#print(f"Suma de pesos original: {suma_peso_original_total:.2f}")
+#print(f"Suma de pesos ajustados: {df_final['peso_final_MAT'].sum():.2f}")
+#print("-" * 50)
+```
+
+```{python}
+# =====================================================================
+# PASO 2: Construcción de dataframes de trabajo (X, y, w)
+# =====================================================================
+
+# Diccionario para mapear las variables predictoras
+mapa_variables = {
+
+    # =========================================================
+    # DATASET: CXTO (Datos de Contexto y Diseño Muestral)
+    # =========================================================
+    
+    # --- Variables Demográficas y Geográficas ---
+    "MdeoInt"               : "zona",
+    "regiones"              : "region",
+    "EF46m"                 : "departamento_residencia",
+    "categoria_centro"      : "categoria_centro",
+    "categoria_grupo"       : "categoria_grupo",
+    "AlumnoGenero"          : "alumno_genero",
+    "EF2d"                  : "ascendencia",
+    "EF2b"                  : "pais_nacimiento",
+    "EDAD"                  : "edad",
+    
+    # --- Índices de Estatus Económico y Social ---
+    "INSE"                  : "idx_inse_alumno",
+    "ESCS_Alumno"           : "idx_esec_alumno",
+    "ESCS_Centro"           : "idx_esec_centro",
+    "ESCS_Grupo"            : "idx_esec_grupo",
+
+    # =========================================================
+    # DATASET: SOCIO (Cuestionario Socioemocional)
+    # =========================================================
+    # --- Índices de Contexto y Actitudes ---
+    "ESTSENTPER_E_ESC50"    : "idx_sentido_pertenencia",
+    "VINCENTREEST_E_ESC50"  : "idx_vinculo_entre_estudiantes",
+    "VINESTADS_E_ESC50"     : "idx_vinculo_estudiantes_adscriptos",
+    "VINESTPROF_E_ESC50"    : "idx_vinculo_estudiantes_docentes",
+    "VOZESTU_E_ESC50"       : "idx_voz_estudiante",
+    "ACTITUDLEC_E_ESC50"    : "idx_actitud_lectura",
+    "ACTITUDMAT_E_ESC50"    : "idx_actitud_matematica",
+    
+    # --- Índices de Habilidades Socioemocionales y Cognitivas ---
+    "AUTOCON_E_ESC50"       : "idx_autocontrol",
+    "AUTOEIDE_E_ESC50"      : "idx_autoeficacia_idioma_espanol",
+    "AUTOEMAT_E_ESC50"      : "idx_autoeficacia_matematica",
+    "AUTOMETA_E_ESC50"      : "idx_autoregulacion_metacognitiva",
+    "EMPATIA_E_ESC50"       : "idx_empatia",
+    "EXTERNALIZ_E_ESC50"    : "idx_conductas_externalizantes",
+    "HABINTER_E_ESC50"      : "idx_habilidades_interpersonales",
+    "HABINTRA_E_ESC50"      : "idx_habilidades_intrapersonales",
+    "HABRELAC_E_ESC50"      : "idx_habilidades_relacionamiento",
+    "INTERNALIZ_E_ESC50"    : "idx_conductas_internalizantes", 
+    "MOTAUTREGA_E_ESC50"    : "idx_motivacion_aprendizaje",
+    "MOTINT_E_ESC50"        : "idx_motivacion_intrinseca",
+    "PERSAC_E_ESC50"        : "idx_perseverancia_academica",
+    "REGEMO_E_ESC50"        : "idx_regulacion_emocional",
+    "VALTIDE_E_ESC50"       : "idx_valoracion_tarea_idioma_espanol",
+    "VALTMAT_E_ESC50"       : "idx_valoracion_tarea_matematica"
+}
+
+# Renombrar columnas. Como evitamos los sufijos _x/_y, las variables originales están intactas.
+df_final = df_final.rename(columns=mapa_variables)
+
+# Crear dataset X asegurando que SOLO contiene las variables mapeadas
+variables_modelo = list(mapa_variables.values())
+X = df_final[variables_modelo].copy()
+
+# Reemplazar códigos numéricos de "No sabe / No contesta" por nulos reales (NaN)
+# tanto en ascendencia como en otras variables sociodemográficas
+X = X.replace({99: np.nan, 98: np.nan, "99": np.nan, "98": np.nan})
+
+# Construir la variable objetivo binaria
+# 1 (satisfactorio) = N4 o N5; 0 (insatisfactorio) = B1, N1, N2 o N3
+y = np.where(df_final["Niveles_MAT"].isin(["N4", "N5"]), 0, 1)
+
+# Construir el vector de pesos muestrales
+w = df_final["peso_final_MAT"].values
+```
+
+### Marco teórico
+
+El análisis del desempeño educativo se sustenta en diferentes perspectivas teóricas que permiten comprender la influencia de las condiciones en las que se desarrolla el proceso de aprendizaje. Estas perspectivas no deben entenderse como explicaciones excluyentes, sino como dimensiones complementarias que permiten abordar el fenómeno desde distintos niveles.
+
+1. Enfoque socioeconómico
+
+El enfoque socioeconómico sostiene que el origen social y las condiciones económicas del hogar condicionan las oportunidades educativas de los estudiantes. Las diferencias en los recursos disponibles pueden afectar tanto las condiciones materiales en las que se desarrolla el aprendizaje como el acceso a bienes y oportunidades educativas.
+
+Desde esta perspectiva, variables como el ingreso del hogar, el nivel educativo de los padres, la ocupación de los adultos responsables, las condiciones de vivienda y las situaciones de pobreza pueden estar asociadas al desempeño académico.
+
+La hipótesis general de este enfoque es que los estudiantes que se desarrollan en contextos con mayores recursos económicos y sociales pueden disponer de mejores condiciones para sostener sus trayectorias educativas y enfrentar las exigencias del proceso de aprendizaje.
+
+2. Enfoque familiar y cultural
+
+El enfoque familiar y cultural pone el énfasis en el entorno inmediato del estudiante y en los recursos culturales y sociales disponibles en su hogar. La familia puede contribuir al aprendizaje mediante la generación de hábitos, expectativas y prácticas que favorecen el desarrollo de competencias educativas.
+
+Entre las variables asociadas a esta perspectiva se encuentran la frecuencia de lectura en el hogar, las expectativas familiares, la participación de los padres en la educación, el capital cultural y el capital social.
+
+Desde este enfoque, el desempeño educativo no depende exclusivamente de los recursos económicos disponibles, sino también de las prácticas familiares, las expectativas respecto de la educación y la exposición del estudiante a actividades y recursos que favorecen el aprendizaje.
+
+3. Enfoque escolar
+
+El enfoque escolar centra la atención en las características de las instituciones educativas y en las condiciones en las que se desarrolla el proceso de enseñanza y aprendizaje. Desde esta perspectiva, las diferencias en los resultados educativos pueden estar relacionadas con los recursos y las prácticas de las instituciones a las que concurren los estudiantes.
+
+Entre las principales variables consideradas se encuentran la calidad docente, la infraestructura, los recursos educativos disponibles, el clima escolar, el liderazgo de los equipos de dirección y el tamaño de las clases.
+
+Este enfoque permite incorporar al análisis factores que trascienden las características individuales del estudiante y considerar el papel que desempeña el contexto institucional en la generación de oportunidades de aprendizaje.
+
+4. Enfoque individual
+
+El enfoque individual explica las diferencias en el desempeño a partir de características propias de los estudiantes. Estas características pueden estar vinculadas tanto con sus capacidades cognitivas como con aspectos motivacionales, conductuales y socioemocionales.
+
+Entre las variables relevantes se encuentran la inteligencia y las habilidades cognitivas, la motivación, la autoeficacia, la salud física y mental, los hábitos de estudio y la asistencia a clases.
+
+Desde esta perspectiva, los estudiantes pueden presentar diferentes niveles de desempeño aun cuando compartan un contexto socioeconómico o educativo similar, debido a diferencias en sus habilidades, actitudes, hábitos y experiencias individuales.
+
+### Metodología
+
+1. Fuente de información y diseño de la encuesta
+
+Como se mencionó, el desarrollo de la investigación se utilizó la información correspondiente a Aristas Media 2022, evaluación realizada por el Instituto Nacional de Evaluación Educativa (INEEd) a estudiantes que cursaban el último año del ciclo básico de educación media en Uruguay.
+
+La encuesta comprende estudiantes pertenecientes a centros educativos de carácter público y privado de todo el país, incluyendo instituciones de educación secundaria y centros de la UTU. El diseño de la muestra es de carácter estratificado, lo que implica que la población estudiantil fue dividida previamente en grupos o estratos definidos a partir de determinadas características relevantes para el diseño muestral. Posteriormente, se seleccionaron unidades dentro de cada estrato, procurando garantizar la representación de los distintos contextos educativos y geográficos de la población objetivo.
+
+Como consecuencia de este diseño, las observaciones no tienen necesariamente el mismo peso estadístico. Por este motivo, la base de datos incluye factores de expansión o pesos relativos, que permiten que las observaciones seleccionadas representen adecuadamente a la población de referencia.
+
+Cada estudiante participante fue evaluado mediante cuatro instancias: dos cuestionarios y dos pruebas. Los cuestionarios corresponden a un formulario de contexto y un formulario socioemocional, mientras que las evaluaciones de desempeño corresponden a una prueba de matemática y una prueba de lectura.
+
+Para el presente trabajo se descargó la información disponible en el sitio oficial del INEEd en formato CSV. Se utilizaron dos archivos principales: uno correspondiente a la información de contexto de los estudiantes y otro correspondiente a sus características socioemocionales. Ambos archivos contienen información relacionada con el resultado obtenido en la prueba de matemática, lo que permitió integrar las diferentes dimensiones de información para construir la base analítica utilizada en el estudio.
+
+2. Variable objetivo: desempeño en matemática
+
+La variable de resultado utilizada en el análisis corresponde al nivel de desempeño alcanzado por el estudiante en la prueba de matemática.
+
+El INEEd clasifica el desempeño de los estudiantes en seis categorías: B1, Nivel 1, Nivel 2, Nivel 3, Nivel 4 y Nivel 5. Estos niveles describen las capacidades que el estudiante demuestra en términos de la complejidad cognitiva de las tareas que puede resolver, tomando como referencia los programas oficiales de la Administración Nacional de Educación Pública (ANEP).
+
+De forma general, los niveles pueden interpretarse de la siguiente manera:
+
+B1 y Nivel 1: el estudiante puede resolver tareas matemáticas muy elementales, generalmente rutinarias y con información explícita.
+Nivel 2: el estudiante puede resolver problemas simples que requieren un procedimiento de un paso o extraer información directa de tablas y gráficos.
+Nivel 3: constituye un nivel de transición hacia la competencia matemática esperada. El estudiante puede resolver problemas que requieren relacionar información o realizar cálculos secuenciales sencillos.
+Niveles 4 y 5: representan una consolidación más profunda de los aprendizajes. Los estudiantes pueden modelizar situaciones de la vida real, resolver problemas no rutinarios, interpretar conceptos algebraicos y fundamentar sus respuestas.
+Binarización del desempeño
+
+Para el desarrollo de los modelos de aprendizaje supervisado, la variable original de seis categorías fue transformada en una variable binaria.
+
+Se definió como desempeño insatisfactorio, codificado como 1, a los estudiantes pertenecientes a las categorías:
+
+B1, Nivel 1, Nivel 2 y Nivel 3.
+
+Por otro lado, se definió como desempeño satisfactorio, codificado como 0, a los estudiantes pertenecientes a:
+
+Nivel 4 y Nivel 5.
+
+Esta clasificación responde a una decisión analítica orientada a la perspectiva de política pública adoptada en este trabajo. Bajo este criterio, alcanzar el Nivel 3 no se considera suficiente para clasificar el desempeño como satisfactorio, ya que representa un nivel de transición hacia la competencia esperada. El desempeño satisfactorio se define, en cambio, como la consolidación de aprendizajes que permita al estudiante enfrentar situaciones matemáticas de mayor complejidad, representadas por los Niveles 4 y 5.
+
+La binarización permite transformar el problema en una tarea de clasificación supervisada, facilitando posteriormente la aplicación e interpretación de distintos modelos de aprendizaje automático.
+
+3. Selección de las variables predictoras
+
+El objetivo del análisis no es únicamente predecir el resultado de la prueba, sino identificar las variables que presentan mayor relevancia para comprender las diferencias observadas en el desempeño matemático.
+
+Por este motivo, se priorizaron los índices construidos por el INEEd, los cuales sintetizan información proveniente de un conjunto amplio de variables categóricas obtenidas mediante los cuestionarios aplicados a los estudiantes.
+
+La utilización de estos índices permite incorporar información previamente estructurada y construida a partir de conocimiento metodológico especializado, evitando reducir el análisis a la evaluación aislada de decenas de respuestas categóricas individuales.
+
+Además de los índices, se incorporaron variables sociodemográficas y educativas consideradas relevantes desde el marco teórico:
+
+Ascendencia racial.
+Género del estudiante.
+Zona del país: Montevideo o Interior.
+Región del país: Este, Oeste, Norte, Sur y Centro.
+Categoría del centro educativo: Secundaria pública, Secundaria privada y UTU.
+Categoría del grupo: Secundaria pública, Secundaria privada, UTU-CBT y UTU-FPB.
+
+De esta manera, el conjunto de variables predictoras incorpora las diferentes dimensiones planteadas en el marco teórico: socioeconómica, familiar y cultural, escolar e individual.
+
+4. Tratamiento de los pesos muestrales y reajuste por participación
+
+Una particularidad importante de los datos utilizados es que las observaciones provienen de una encuesta con diseño muestral estratificado. Por lo tanto, cada estudiante cuenta con un peso que representa la cantidad de estudiantes de la población a la que dicha observación representa.
+
+Sin embargo, no todos los estudiantes incluidos en el padrón cuentan necesariamente con un resultado válido en la prueba de matemática. Dado que los modelos supervisados requieren que la variable objetivo esté observada, eliminar las observaciones sin resultado podría modificar la composición de la población representada y generar un posible sesgo de selección.
+
+Para abordar este problema se realizó un reajuste de los pesos mediante un modelo de propensión a la participación en la prueba.
+
+4.1. Indicador de participación
+
+En primer lugar, se construyó una variable indicadora de participación:
+
+
+La variable se determinó a partir de la presencia o ausencia de información en la variable correspondiente al nivel de desempeño en matemática.
+
+4.2. Estimación de la probabilidad de participación
+
+A partir del padrón completo se estimó la probabilidad de que cada estudiante contara con un resultado válido en la prueba:
+
+donde (X_i) representa las características observadas del estudiante utilizadas para estimar dicha probabilidad.
+
+En términos intuitivos, esta probabilidad representa la posibilidad estimada de que un estudiante con determinadas características haya participado o cuente con un resultado válido en la evaluación.
+
+4.3. Ajuste de los pesos
+
+Para los estudiantes que sí cuentan con resultado de matemática, el peso original se ajustó mediante la inversa de la probabilidad estimada de participación:
+
+
+De esta manera, aquellos estudiantes con menor probabilidad estimada de participación reciben un mayor peso, compensando parcialmente su menor representación dentro de las observaciones efectivamente disponibles para el modelado.
+
+4.4. Estabilización de las probabilidades
+
+Para evitar que probabilidades extremadamente pequeñas generen pesos excesivamente grandes, se estableció un límite inferior:
+
+
+Esto limita la magnitud máxima del ajuste y evita que unas pocas observaciones concentren una proporción excesiva del peso total.
+
+4.5. Normalización
+
+Finalmente, los pesos ajustados fueron normalizados para conservar la escala agregada de los pesos originales:
+
+
+En términos generales, este procedimiento busca que las observaciones que cuentan con resultado de matemática mantengan una representación coherente con la población total, reduciendo el posible efecto de la pérdida de observaciones sobre la composición de la muestra utilizada en los modelos.
+
+
+## EDA
+
+### Auditoría de variables
+```{python}
+df_final_modelo = df_final[variables_modelo].copy()
+df_final_modelo['target'] = y
+
+#print("AUDITORIA DE VARIABLES DEL DATASET df_final_modelo")
+
+print(f"\nDimensiones del dataset: {df_final_modelo.shape[0]} filas × {df_final_modelo.shape[1]} columnas\n")
+
+audit = pd.DataFrame({
+    'dtype':          df_final_modelo.dtypes,
+    'nulos':          df_final_modelo.isnull().sum(),
+    'pct_nulos':      (df_final_modelo.isnull().sum() / len(df_final_modelo) * 100).round(2),
+    'valores_únicos': df_final_modelo.nunique(),
+    'moda':           df_final_modelo.mode().iloc[0], # Extrae la primera fila de la moda
+    'ejemplo':        df_final_modelo.sample(1).iloc[0], # Genera muestra aleatoria y extrae primera fila
+    })
+```
+
+
+\newpage
+```{python}
+#| echo: false
+#| output: asis
+
+from IPython.display import Markdown
+
+tabla = audit.to_latex(
+    index=True,
+    escape=True
+)
+
+print(r"""
+\begin{sidewaystable}
+\centering
+\small
+""" + tabla + r"""
+\caption{Auditoría de variables del dataset}
+\end{sidewaystable}
+""")
+```
+
+### Barplots categóricos
+
+```{python}
+import matplotlib.ticker as mtick
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# ==============================
+# Variables a graficar
+# ==============================
+variables_a_graficar = [
+    'zona',
+    'region',
+    'departamento_residencia',
+    'alumno_genero',
+    'ascendencia'
+]
+
+# ==============================
+# Diccionarios de etiquetas
+# ==============================
+
+mapa_ascendencia = {
+    1: "Blanca",
+    2: "Afro o negra",
+    3: "Asiática o amarilla",
+    4: "Indígena",
+    5: "Otra"
+}
+
+mapa_departamentos = {
+    1: "Montevideo",
+    2: "Artigas",
+    3: "Canelones",
+    4: "Cerro Largo",
+    5: "Colonia",
+    6: "Durazno",
+    7: "Flores",
+    8: "Florida",
+    9: "Lavalleja",
+    10: "Maldonado",
+    11: "Paysandú",
+    12: "Río Negro",
+    13: "Rivera",
+    14: "Rocha",
+    15: "Salto",
+    16: "San José",
+    17: "Soriano",
+    18: "Tacuarembó",
+    19: "Treinta y Tres"
+}
+
+# Títulos más amigables (opcional)
+titulos = {
+    'zona': 'Zona',
+    'region': 'Región',
+    'departamento_residencia': 'Departamento de residencia',
+    'alumno_genero': 'Género',
+    'ascendencia': 'Ascendencia'
+}
+
+# ==============================
+# Tasa global
+# ==============================
+
+tasa_base = df_final_modelo['target'].mean()
+
+sns.set_theme(style="whitegrid")
+
+fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(15, 20))
+axes_flat = axes.flatten()
+
+# ==============================
+# Bucle de gráficos
+# ==============================
+
+for i, var in enumerate(variables_a_graficar):
+
+    ax = axes_flat[i]
+    ax.grid(False)
+
+    data_grafico = (
+        df_final_modelo
+        .groupby(var)['target']
+        .agg(
+            tasa='mean',
+            n='size'
+        )
+        .reset_index()
+    )
+
+    # Reemplazar etiquetas únicamente para el gráfico
+    if var == 'ascendencia':
+        data_grafico[var] = data_grafico[var].map(mapa_ascendencia)
+
+    elif var == 'departamento_residencia':
+        data_grafico[var] = data_grafico[var].map(mapa_departamentos)
+
+    # Rellenar posibles NaNs (floats) con un texto y asegurar que todo sea string
+    data_grafico[var] = data_grafico[var].fillna('Sin dato').astype(str)
+    
+    orden_categorias = data_grafico[var].tolist()
+
+    sns.barplot(
+        x=var,
+        y='tasa',
+        data=data_grafico,
+        order=orden_categorias,
+        hue=var,
+        hue_order=orden_categorias,
+        palette='muted',
+        legend=False,
+        edgecolor='#404040',
+        ax=ax
+    )
+
+    # Línea de tasa global
+    linea_base = ax.axhline(
+        y=tasa_base,
+        color='crimson',
+        linestyle='--',
+        linewidth=1.5
+    )
+
+    ax.legend(
+        [linea_base],
+        [f'Tasa global ({tasa_base:.1%})'],
+        loc='lower left',
+        fontsize=8.5,
+        frameon=True,
+        facecolor='white',
+        edgecolor='none'
+    )
+
+    ax.set_title(
+        f'Desaprobación por {titulos.get(var,var)}',
+        fontsize=11,
+        fontweight='bold'
+    )
+
+    ax.set_xlabel(titulos.get(var,var), fontsize=9)
+    ax.set_ylabel('Tasa de desaprobación', fontsize=9)
+
+    max_val = data_grafico['tasa'].max()
+    ax.set_ylim(0, max(max_val + 0.10, tasa_base + 0.05))
+
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.tick_params(axis='y', labelsize=8.5)
+    ax.grid(axis='y', linestyle=':', alpha=0.6)
+
+    # Rotar etiquetas si son largas
+    if var in ['departamento_residencia', 'ascendencia']:
+        ax.tick_params(axis='x', rotation=45)
+        for tick in ax.get_xticklabels():
+            tick.set_horizontalalignment('right')
+
+    # Etiquetas con tamaño muestral
+    for j, p in enumerate(ax.patches):
+
+        if j >= len(data_grafico):
+            break
+
+        height = p.get_height()
+
+        ax.annotate(
+            f"n:{int(data_grafico.iloc[j]['n'])}",
+            (p.get_x() + p.get_width()/2, height),
+            ha='center',
+            va='bottom',
+            xytext=(0,5),
+            textcoords='offset points',
+            fontsize=8,
+            fontweight='bold'
+        )
+
+# Ocultar ejes sobrantes
+for j in range(len(variables_a_graficar), len(axes_flat)):
+    axes_flat[j].set_visible(False)
+
+plt.suptitle(
+    f'Análisis de la tasa de desaprobación según variables categóricas\nn = {len(df_final_modelo):,}',
+    fontsize=16,
+    fontweight='bold',
+    y=1.02
+)
+
+plt.tight_layout()
+plt.show()
+```
+
+#### Análisis de los barplots categóricos
+
+A partir de los gráficos, se observa que la tasa global de desaprobación en la prueba de Matemática es elevada (88,7%), aunque existen diferencias entre los distintos grupos analizados.
+
+- Zona de residencia: los estudiantes del Interior presentan una tasa de desaprobación superior a la media y mayor que la observada en Montevideo, lo que sugiere una leve brecha territorial en el desempeño.
+
+- Región: se aprecian diferencias moderadas entre regiones. Norte, Este y Oeste exhiben las tasas de desaprobación más altas, mientras que la región Sur presenta la menor proporción de estudiantes desaprobados, ubicándose por debajo de la tasa global.
+
+- Departamento de residencia: existe heterogeneidad entre departamentos. Algunos, como Artigas, muestran tasas de desaprobación cercanas al 97%, mientras que Montevideo y Durazno presentan valores relativamente menores. Sin embargo, en varios departamentos el tamaño muestral es reducido, por lo que esas diferencias deben interpretarse con cautela.
+
+- Género: las diferencias son prácticamente inexistentes. Mujeres y varones presentan tasas de desaprobación muy similares, cercanas a la media, mientras que la categoría "Otro" se ubica levemente por debajo, aunque con un número muy pequeño de casos (n=231).
+
+- Ascendencia: se observan algunas diferencias. Los estudiantes que se identifican con ascendencia asiática o amarilla presentan la mayor tasa de desaprobación, seguidos por quienes reportan ascendencia afro o negra y otra. En contraste, quienes declaran ascendencia blanca muestran la menor tasa de desaprobación del grupo, situándose por debajo de la media global.
+
+### Boxplots numéricos
+
+```{python}
+# Realizar análisis de variables numéricas (Boxplots)
+
+# Definimos las variables numéricas a analizar (Son 7 variables en total)
+variables_boxplot = [
+    'idx_inse_alumno',
+    'idx_esec_alumno',
+    'idx_esec_centro',
+    'idx_esec_grupo',
+    'idx_actitud_matematica',
+    'idx_vinculo_estudiantes_docentes',
+    'idx_sentido_pertenencia'
+]
+
+# Configuramos el estilo estético de Seaborn
+sns.set_theme(style="whitegrid")
+
+# SOLUCIÓN: Cambiamos a 3 filas x 3 columnas para que entren las 7 variables
+fig, axes = plt.subplots(nrows=3, ncols=3, figsize=(16, 14))
+
+# Aplanamos la matriz para iterar linealmente
+axes_flat = axes.flat
+
+# Mapeamos títulos
+titulos = {
+    'idx_inse_alumno': 'Estatus del nivel socioeconómico del estudiante',
+    'idx_esec_alumno': 'Índice del nivel cultural y socioeconómico del estudiante',
+    'idx_esec_centro': 'Índice del nivel cultural y socioeconómico del centro educativo',
+    'idx_esec_grupo': 'Índice del nivel cultural y socioeconómico del grupo',
+    'idx_actitud_matematica': 'Índice de actitud hacia la matemática',
+    'idx_vinculo_estudiantes_docentes': 'Índice de vínculo entre estudiantes y docentes',
+    'idx_sentido_pertenencia': 'Índice de sentido de pertenencia'
+}
+
+# Iteramos para construir cada Boxplot
+for i, var in enumerate(variables_boxplot):
+    ax = axes_flat[i]
+
+    sns.boxplot(
+        x='target', # Mejor pasar el string si ya especificamos el data=
+        y=var,
+        data=df_final_modelo,
+        ax=ax,
+        palette="Set2",
+        hue='target',
+        legend=False
+    )
+
+    # Adaptamos títulos y etiquetas
+    ax.set_title(
+        f"{titulos.get(var, var)}",
+        fontsize=11,
+        fontweight='bold',
+        pad=8
+    )
+    ax.set_xlabel("¿Desaprueba? (0=No, 1=Si)", fontsize=9, fontweight='bold')
+    ax.set_ylabel(titulos.get(var, var), fontsize=9, fontweight='bold')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+# Apagamos cuadrantes vacíos (los espacios 8 y 9)
+for j in range(len(variables_boxplot), len(axes_flat)):
+    axes_flat[j].axis('off')
+
+# Generamos título general, ajustamos layout y mostramos
+plt.suptitle("Análisis de variables cuantitativas vs. Desaprobación / Aprobación (Boxplots)", y=1.02, fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.show()
+```
+
+#### Análisis de los boxplots numéricos
+
+A partir de los boxplots se observan diferencias claras entre los estudiantes que aprueban (0) y quienes desaprueban (1) la prueba de Matemática para algunos de los índices analizados.
+
+- Estatus del nivel socioeconómico del estudiante: los estudiantes que aprueban presentan, en general, un nivel socioeconómico más alto. La mediana del índice es considerablemente superior en el grupo que aprueba, mientras que quienes desaprueban se concentran en valores más bajos. Esto sugiere una asociación negativa entre el nivel socioeconómico y la probabilidad de desaprobación.
+
+- Índice del nivel cultural y socioeconómico del estudiante: se observa un patrón similar al anterior. Los estudiantes que aprueban presentan valores positivos y una mediana claramente superior, mientras que quienes desaprueban se concentran en valores inferiores. La diferencia entre ambos grupos es marcada, lo que indica que este índice podría ser un importante factor asociado al desempeño en Matemática.
+
+- Índice de actitud hacia la matemática: los estudiantes que aprueban muestran una actitud más favorable hacia la asignatura, reflejada en una mediana sensiblemente mayor. Aunque existe cierto solapamiento entre ambos grupos, la distribución evidencia que una actitud más positiva hacia la Matemática se asocia con una menor probabilidad de desaprobación.
+
+- Índice de vínculo entre estudiantes y docentes: las distribuciones de ambos grupos son muy similares, con medianas prácticamente iguales y una fuerte superposición de los rangos intercuartílicos. Esto sugiere que, de manera aislada, este indicador presenta una capacidad limitada para diferenciar entre estudiantes que aprueban y desaprueban.
+
+- Índice de sentido de pertenencia: también se observan diferencias reducidas entre ambos grupos. Los estudiantes que aprueban presentan una mediana ligeramente superior, aunque la superposición entre las distribuciones es considerable, por lo que el sentido de pertenencia parece tener una asociación más débil con el resultado de la prueba.
+
+### Barplots numéricos
+
+```{python}
+# Barplots de tasa de desaprobación por rangos de variables numéricas.
+
+# Hacemos lo mismo pero para las variables numericas, pero a estas las tendremos que dividir en rangos para los graficos de barras. 
+
+n_cols = 2
+# Calculamos las filas necesarias de forma dinámica
+n_rows = math.ceil(len(variables_boxplot) / n_cols) 
+
+# Creamos la copia de trabajo y pasamos el target a porcentaje directo (0 a 100%)
+df_plot = df_final_modelo.copy()
+df_plot['Desaprueba_porcentaje'] = df_plot['target'].map({1: 100, 0: 0})
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
+
+# Aplanamos el array de ejes para poder iterar en un solo bucle limpio (aplasta una matriz 2D en 1D)
+axes = axes.flatten()
+
+# ==================================================================================================
+# BUCLE EN MATRIZ DE SUBPLOTS
+# ==================================================================================================
+for i, var in enumerate(variables_boxplot):
+    ax = axes[i]
+    col_intervalo = f'{var}_Rango'
+    
+    # 1. Creamos los rangos con qcut
+    intervalos = pd.qcut(df_plot[var], q=20, duplicates='drop')
+    
+    # 2. Forzamos estrictamente el formato a 1 decimal (ej: "(25.8, 29.5]")
+    df_plot[col_intervalo] = intervalos.apply(
+        lambda x: f"({x.left:.1f}, {x.right:.1f}]" if pd.notna(x) else x
+    )
+
+    data_tasa_num = (
+        df_plot.groupby(col_intervalo, observed=True)['Desaprueba_porcentaje']
+        .mean()
+        # sort_index() funciona mal si los rangos son texto y no categorías, 
+        # pero al venir de qcut, el groupby ya respeta el orden original de los intervalos
+        .reset_index()
+    )
+
+    # Ya no necesitamos hacer el .astype(str) porque el lambda de arriba ya los convirtió a texto
+    
+    # Dibujamos el barplot en el eje correspondiente
+    sns.barplot(
+        x=col_intervalo, 
+        y='Desaprueba_porcentaje', 
+        data=data_tasa_num, 
+        palette='Oranges_r',
+        hue=col_intervalo,
+        legend=False,
+        dodge=False,
+        ax=ax,
+        edgecolor='#404040', 
+        linewidth=0.8
+    )
+
+    tasa_base = df_plot['Desaprueba_porcentaje'].mean()  
+    
+    # Añadimos la línea roja con la tasa base del modelo
+    ax.axhline(
+        y=tasa_base, 
+        color='crimson', 
+        linestyle='--', 
+        linewidth=1.2, 
+        label=f'Base Global ({tasa_base:.2f}%)' if i == 0 else ""
+    )
+
+    ax.set_title(f"Tasa de desaprobación por Rangos de {titulos.get(var, var)}", fontsize=11, fontweight='bold', pad=8)
+    ax.set_xlabel('Rangos', fontsize=9) 
+    ax.set_ylabel('% Abandonos', fontsize=9)
+    ax.set_ylim(0, max(data_tasa_num['Desaprueba_porcentaje'].max() + 5, 25))
+    ax.grid(axis='y', linestyle=':', alpha=0.5)
+
+    ax.tick_params(axis='x', rotation=45)
+    for tick in ax.get_xticklabels():
+        tick.set_horizontalalignment('right')
+
+# Eliminamos los subplots sobrantes si el número de variables es impar
+for j in range(i + 1, len(axes)):
+    fig.delaxes(axes[j])
+
+plt.tight_layout()
+plt.show()
+```
+
+### Correlaciones lineales
+
+```{python}
+#  Generar matriz de correlación (todas las variables numéricas + target)
+
+variables_corr = [
+    # --- Índices de Estatus Económico y Social ---
+    'idx_inse_alumno',
+    'idx_esec_alumno',
+    'idx_esec_centro',
+    'idx_esec_grupo',
+    
+    # --- Índices de Contexto y Actitudes ---
+    'idx_sentido_pertenencia',
+    'idx_vinculo_entre_estudiantes',
+    'idx_vinculo_estudiantes_adscriptos',
+    'idx_vinculo_estudiantes_docentes',
+    'idx_voz_estudiante',
+    'idx_actitud_lectura',
+    'idx_actitud_matematica',
+    
+    # --- Índices de Habilidades Socioemocionales y Cognitivas ---
+    'idx_autocontrol',
+    'idx_autoeficacia_idioma_espanol',
+    'idx_autoeficacia_matematica',
+    'idx_autoregulacion_metacognitiva',
+    'idx_empatia',
+    'idx_conductas_externalizantes',
+    'idx_habilidades_interpersonales',
+    'idx_habilidades_intrapersonales',
+    'idx_habilidades_relacionamiento',
+    'idx_conductas_internalizantes', 
+    'idx_motivacion_aprendizaje',
+    'idx_motivacion_intrinseca',
+    'idx_perseverancia_academica',
+    'idx_regulacion_emocional',
+    'idx_valoracion_tarea_idioma_espanol',
+    'idx_valoracion_tarea_matematica'
+]
+
+# Seleccionar únicamente las variables de interés
+df_eda_corr = df_final_modelo[variables_corr + ['target']].copy()
+
+# Matriz de correlación
+corr_eda = df_eda_corr.corr(numeric_only=True)
+
+# Reordenar para dejar el target al final
+cols_ordenadas = [c for c in corr_eda.columns if c != 'target'] + ['target']
+corr_eda = corr_eda.loc[cols_ordenadas, cols_ordenadas]
+
+
+# =========================================================
+# HEATMAP DE CORRELACIÓN
+# =========================================================
+# Aumentamos considerablemente el tamaño de la figura (20x18)
+plt.figure(figsize=(20, 18))
+
+sns.heatmap(
+    corr_eda,
+    annot=True,
+    fmt=".2f",
+    cmap="RdBu_r",
+    center=0,
+    vmin=-1,
+    vmax=1,
+    square=True,
+    linewidths=0.5,
+    cbar_kws={"shrink": 0.85},
+    annot_kws={"size": 8} # Reducimos un poco el tamaño de la fuente de los números
+)
+
+plt.xticks(rotation=45, ha='right', fontsize=10, fontweight='bold')
+plt.yticks(fontsize=10, fontweight='bold')
+plt.title(
+    'Matriz de correlación (Pearson)\nTodas las variables numéricas',
+    fontsize=16,
+    fontweight='bold',
+    pad=20
+)
+
+plt.tight_layout()
+plt.show()
+
+
+# =========================================================
+# RANKING TORNADO (CORRELACIÓN CON EL TARGET)
+# =========================================================
+
+corr_target = corr_eda['target'].drop('target')
+
+ranking_pos = corr_target[corr_target >= 0].sort_values(ascending=False)
+ranking_neg = corr_target[corr_target < 0].sort_values(ascending=False)
+
+ranking = pd.concat([ranking_pos, ranking_neg])
+
+# Aumentamos la altura de la figura para acomodar 27 barras sin superponerse
+fig, ax = plt.subplots(figsize=(10, 12))
+
+colores = ['#2ca02c' if v >= 0 else '#d62728' for v in ranking]
+
+ax.barh(ranking.index, ranking.values, color=colores, height=0.7)
+ax.axvline(0, color='black', linewidth=1)
+
+ax.invert_yaxis()
+ax.set_xlabel('Correlación con target', fontweight='bold', fontsize=11)
+ax.set_title(
+    'Ranking de correlación de índices socioemocionales vs Target',
+    fontsize=14,
+    fontweight='bold',
+    pad=15
+)
+
+# CORRECCIÓN 1: Definimos los ticks primero y luego las etiquetas para evitar el UserWarning
+ax.set_yticks(range(len(ranking)))
+ax.set_yticklabels(ranking.index, fontweight='bold')
+
+for i, v in enumerate(ranking.values):
+    ax.text(
+        v + (0.01 if v >= 0 else -0.01),
+        i,
+        f'{v:+.3f}',
+        va='center',
+        ha='left' if v >= 0 else 'right',
+        fontsize=9,
+        fontweight='bold'  # CORRECCIÓN 2: Cambiamos 'semibold' por 'bold' para evitar el warning de fuente
+    )
+
+lim = max(abs(ranking.min()), abs(ranking.max())) + 0.1
+ax.set_xlim(-lim, lim)
+ax.grid(axis='x', linestyle=':', alpha=0.5)
+
+# Borde exterior grueso
+for spine in ax.spines.values():
+    spine.set_linewidth(1.2)
+    spine.set_color('black')
+
+plt.tight_layout()
+plt.show()
+```
+
+\newpage
+
+#### Análisis de correlaciones con la tasa de desaprobación (target)
+
+- Los factores socioeconómicos y educativos (idx_inse_alumno e idx_esec_alumno) son los que más se asocian (aunque de forma moderada) con la desaprobación: a mejores índices, menor tasa de desaprobación.
+
+- La actitud hacia matemáticas tiene cierta influencia, pero es más débil que los factores estructurales.
+
+- El vínculo con docentes y el sentido de pertenencia tienen una correlación casi nula con la desaprobación, lo que sugiere que, en este contexto, no son factores determinantes para explicar el rendimiento en términos de aprobación/desaprobación.
+
+- No hay correlaciones fuertes (todas están por debajo de 0.4 en valor absoluto), lo que indica que la desaprobación es un fenómeno multifactorial y que estas variables explican solo una parte de su variabilidad.
+
+Durante el análisis exploratorio (EDA), se identificó la presencia de valores atípicos (e.g., códigos 98 y 99) en variables sociodemográficas como la Ascendencia. Dado que el diccionario de datos oficial del INEEd solo categoriza respuestas del 1 al 5, se infirió que estos códigos corresponden a marcas de sistema para 'No sabe/No contesta'. En consecuencia, fueron transformados a nulos (NaN) para permitir un manejo correcto en el Pipeline de imputación y no distorsionar la evaluación de equidad algorítmica.

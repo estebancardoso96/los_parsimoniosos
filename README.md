@@ -2,7 +2,7 @@
 
 Este proyecto está pensado para ejecutarse en Visual Studio Code con Conda y para correr únicamente el notebook principal:
 
-- Trabajo_final_version_0_con_arbol.ipynb
+- Script_trabajo_final.ipynb
 
 ## Requisitos
 
@@ -36,7 +36,7 @@ python -m ipykernel install --user --name los_parsimoniosos --display-name "Pyth
 ## 3. Abrir y ejecutar el notebook en VS Code
 
 1. Abre Visual Studio Code.
-2. Abre el archivo [Trabajo_final_version_0_con_arbol.ipynb](Trabajo_final_version_0_con_arbol.ipynb).
+2. Abre el archivo [Script_trabajo_final.ipynb](Script_trabajo_final.ipynb).
 3. En la esquina superior derecha del notebook, selecciona el kernel:
    - Python (los_parsimoniosos)
 4. Ejecuta las celdas en orden.
@@ -44,17 +44,3 @@ python -m ipykernel install --user --name los_parsimoniosos --display-name "Pyth
 ## 4. Datos usados por el notebook
 
 El notebook descarga los datos directamente desde las URLs internas del INEEd, por lo que no necesitas tener archivos locales adicionales para correrlo.
-
-## 5. Renderizar el informe técnico (opcional)
-
-Si quieres generar el informe con Quarto, puedes ejecutar:
-
-```bash
-quarto render informe_tecnico.qmd
-```
-
-Si aparece un error de LaTeX, instala TinyTeX:
-
-```bash
-quarto install tinytex
-```

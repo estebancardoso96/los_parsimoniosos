@@ -33,7 +33,6 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score, confusion_matrix, precision_recall_curve, ConfusionMatrixDisplay 
-from fairlearn.metrics import MetricFrame, selection_rate
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 ```
 
